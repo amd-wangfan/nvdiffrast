@@ -9,9 +9,18 @@
 #include "torch_common.inl"
 #include "../common/common.h"
 #include "../common/interpolate.h"
+#ifdef USE_ROCM
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#endif
 
 //------------------------------------------------------------------------
 // Kernel prototypes.
+
+#ifdef USE_ROCM
+#define LAUNCH_KERNEL hipLaunchKernel
+#else
+#define LAUNCH_KERNEL cudaLaunchKernel
+#endif
 
 void InterpolateFwdKernel   (const InterpolateKernelParams p);
 void InterpolateFwdKernelDa (const InterpolateKernelParams p);
@@ -117,7 +126,7 @@ std::tuple<torch::Tensor, torch::Tensor> interpolate_fwd_da(torch::Tensor attr, 
     // Launch CUDA kernel.
     void* args[] = {&p};
     void* func = enable_da ? (void*)InterpolateFwdKernelDa : (void*)InterpolateFwdKernel;
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel(func, gridSize, blockSize, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL(func, gridSize, blockSize, args, 0, stream));
 
     // Return results.
     return std::tuple<torch::Tensor, torch::Tensor>(out, out_da);
@@ -232,7 +241,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> interpolate_grad_da(torc
     // Launch CUDA kernel.
     void* args[] = {&p};
     void* func = enable_da ? (void*)InterpolateGradKernelDa : (void*)InterpolateGradKernel;
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel(func, gridSize, blockSize, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL(func, gridSize, blockSize, args, 0, stream));
 
     // Return results.
     return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>(gradAttr, gradRaster, gradRasterDB);

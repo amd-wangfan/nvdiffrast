@@ -7,7 +7,9 @@
 // license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 #pragma once
-#include <cuda_runtime.h>
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h> 
+#endif
 #include <cstdint>
 
 namespace CR

@@ -83,8 +83,10 @@ __global__ void RasterizeCudaFwdShaderKernel(const RasterizeCudaFwdShaderParams 
     float zw = z / w;
 
     // Clamps to avoid NaNs.
-    b0 = __saturatef(b0); // Clamp to [+0.0, 1.0].
-    b1 = __saturatef(b1); // Clamp to [+0.0, 1.0].
+    // b0 = __saturatef(b0); // Clamp to [+0.0, 1.0].
+    // b1 = __saturatef(b1); // Clamp to [+0.0, 1.0].
+    b0 = fminf(fmaxf(b0, 0.0f), 1.0f);
+    b1 = fminf(fmaxf(b1, 0.0f), 1.0f);
     zw = fmaxf(fminf(zw, 1.f), -1.f);
 
     // Emit output.
@@ -118,6 +120,7 @@ static __forceinline__ __device__ void RasterizeGradKernelTemplate(const Rasteri
 {
     // Temporary space for coalesced atomics.
     CA_DECLARE_TEMP(RAST_GRAD_MAX_KERNEL_BLOCK_WIDTH * RAST_GRAD_MAX_KERNEL_BLOCK_HEIGHT);
+    CA_DECLARE_SYNC_TEMP(RAST_GRAD_MAX_KERNEL_BLOCK_WIDTH * RAST_GRAD_MAX_KERNEL_BLOCK_HEIGHT);
 
     // Calculate pixel position.
     int px = blockIdx.x * blockDim.x + threadIdx.x;
@@ -164,7 +167,7 @@ static __forceinline__ __device__ void RasterizeGradKernelTemplate(const Rasteri
     }
 
     // Initialize coalesced atomics.
-    CA_SET_GROUP(triIdx);
+    CA_SET_GROUP(triIdx, RAST_GRAD_MAX_KERNEL_BLOCK_WIDTH);        
 
     // Fetch vertex positions.
     float4 p0 = ((float4*)p.pos)[vi0];

@@ -10,9 +10,18 @@
 #include "torch_types.h"
 #include "../common/common.h"
 #include "../common/antialias.h"
+#if USE_ROCM
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#endif
 
 //------------------------------------------------------------------------
 // Kernel prototypes.
+
+#ifdef USE_ROCM
+#define LAUNCH_KERNEL hipLaunchKernel
+#else
+#define LAUNCH_KERNEL cudaLaunchKernel
+#endif
 
 void AntialiasFwdMeshKernel         (const AntialiasKernelParams p);
 void AntialiasFwdDiscontinuityKernel(const AntialiasKernelParams p);
@@ -54,7 +63,7 @@ TopologyHashWrapper antialias_construct_topology_hash(torch::Tensor tri)
 
     // Populate the hash.
     void* args[] = {&p};
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel((void*)AntialiasFwdMeshKernel, (p.numTriangles - 1) / AA_MESH_KERNEL_THREADS_PER_BLOCK + 1, AA_MESH_KERNEL_THREADS_PER_BLOCK, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL((void*)AntialiasFwdMeshKernel, (p.numTriangles - 1) / AA_MESH_KERNEL_THREADS_PER_BLOCK + 1, AA_MESH_KERNEL_THREADS_PER_BLOCK, args, 0, stream));
 
     // Return.
     TopologyHashWrapper hash_wrap;
@@ -139,7 +148,7 @@ std::tuple<torch::Tensor, torch::Tensor> antialias_fwd(torch::Tensor color, torc
     void* args[] = {&p};
     dim3 blockSize(AA_DISCONTINUITY_KERNEL_BLOCK_WIDTH, AA_DISCONTINUITY_KERNEL_BLOCK_HEIGHT, 1);
     dim3 gridSize = getLaunchGridSize(blockSize, p.width, p.height, p.n);
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel((void*)AntialiasFwdDiscontinuityKernel, gridSize, blockSize, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL((void*)AntialiasFwdDiscontinuityKernel, gridSize, blockSize, args, 0, stream));
 
     // Determine optimum block size for the persistent analysis kernel and launch.
     int device = 0;
@@ -148,7 +157,7 @@ std::tuple<torch::Tensor, torch::Tensor> antialias_fwd(torch::Tensor color, torc
     NVDR_CHECK_CUDA_ERROR(cudaGetDevice(&device));
     NVDR_CHECK_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numCTA, (void*)AntialiasFwdAnalysisKernel, AA_ANALYSIS_KERNEL_THREADS_PER_BLOCK, 0));
     NVDR_CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, device));
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel((void*)AntialiasFwdAnalysisKernel, numCTA * numSM, AA_ANALYSIS_KERNEL_THREADS_PER_BLOCK, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL((void*)AntialiasFwdAnalysisKernel, numCTA * numSM, AA_ANALYSIS_KERNEL_THREADS_PER_BLOCK, args, 0, stream));
 
     // Return results.
     return std::tuple<torch::Tensor, torch::Tensor>(out, work_buffer);
@@ -234,7 +243,7 @@ std::tuple<torch::Tensor, torch::Tensor> antialias_grad(torch::Tensor color, tor
     NVDR_CHECK_CUDA_ERROR(cudaGetDevice(&device));
     NVDR_CHECK_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numCTA, (void*)AntialiasGradKernel, AA_GRAD_KERNEL_THREADS_PER_BLOCK, 0));
     NVDR_CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, device));
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel((void*)AntialiasGradKernel, numCTA * numSM, AA_GRAD_KERNEL_THREADS_PER_BLOCK, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL((void*)AntialiasGradKernel, numCTA * numSM, AA_GRAD_KERNEL_THREADS_PER_BLOCK, args, 0, stream));
 
     // Return results.
     return std::tuple<torch::Tensor, torch::Tensor>(grad_color, grad_pos);

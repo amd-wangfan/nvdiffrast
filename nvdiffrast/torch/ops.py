@@ -12,6 +12,11 @@ import numpy as np
 import os
 import torch
 import torch.utils.cpp_extension
+import shutil
+from pathlib import Path
+
+# check if ROCm support
+is_rocm = True if ((torch.version.hip is not None) and (torch.utils.cpp_extension.ROCM_HOME is not None)) else False
 
 #----------------------------------------------------------------------------
 # C++/Cuda plugin compiler/loader.
@@ -120,9 +125,37 @@ def _get_plugin(gl=False):
         except:
             pass
 
+    # sync header files
+    if is_rocm:
+        cuda_raster_impl_dir = Path(Path(__file__).resolve().parent, "../common/cudaraster/impl")
+        cuda_raster_dir = Path(Path(__file__).resolve().parent, "../common/cudaraster")
+        hip_raster_impl_dir = Path(Path(__file__).resolve().parent, "../common/hipraster/impl")
+        hip_raster_dir = Path(Path(__file__).resolve().parent, "../common/hipraster")
+        
+        if not hip_raster_dir.exists():
+            hip_raster_dir.mkdir(parents=True)
+        if not hip_raster_impl_dir.exists():
+            hip_raster_impl_dir.mkdir(parents=True)
+        
+        # copy all hpp/inl files
+        for hpp_file in cuda_raster_impl_dir.glob("*.hpp"):
+            shutil.copy(hpp_file, hip_raster_impl_dir/hpp_file.name)
+        for inl_file in cuda_raster_impl_dir.glob("*.inl"):
+            shutil.copy(inl_file, hip_raster_impl_dir/inl_file.name)
+        for hpp_file in cuda_raster_dir.glob("*.hpp"):
+            shutil.copy(hpp_file, hip_raster_dir/hpp_file.name)
+
     # Compile and load.
     source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]
-    torch.utils.cpp_extension.load(name=plugin_name, sources=source_paths, extra_cflags=common_opts+cc_opts, extra_cuda_cflags=common_opts+['-lineinfo'], extra_ldflags=ldflags, with_cuda=True, verbose=False)
+    # add include path 
+    # include_dirs = sorted(set(os.path.dirname(p) for p in source_paths))
+    # include_flags = [f"-I{p}" for p in include_dirs]
+    # common_opts += include_flags
+    cuda_opts = ['-lineinfo']
+    if is_rocm:
+        cuda_opts += ['-DUSE_HIP', '-DGFX942_SUPPORTED']
+
+    torch.utils.cpp_extension.load(name=plugin_name, sources=source_paths, extra_cflags=common_opts+cc_opts, extra_cuda_cflags=common_opts+cuda_opts, extra_ldflags=ldflags, with_cuda=True, verbose=False)
 
     # Import, cache, and return the compiled module.
     _cached_plugin[gl] = importlib.import_module(plugin_name)

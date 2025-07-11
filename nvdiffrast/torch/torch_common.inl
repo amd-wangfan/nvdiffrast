@@ -8,6 +8,9 @@
 
 #pragma once
 #include "../common/framework.h"
+#ifdef USE_ROCM
+#include <ATen/hip/HIPUtils.h>
+#endif
 
 //------------------------------------------------------------------------
 // Input check helpers.

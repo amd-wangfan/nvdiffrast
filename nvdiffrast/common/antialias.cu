@@ -388,6 +388,7 @@ __global__ void AntialiasGradKernel(const AntialiasKernelParams p)
 {
     // Temporary space for coalesced atomics.
     CA_DECLARE_TEMP(AA_GRAD_KERNEL_THREADS_PER_BLOCK);
+    CA_DECLARE_SYNC_TEMP(AA_GRAD_KERNEL_THREADS_PER_BLOCK);
     __shared__ int s_base; // Work counter communication across entire CTA.
 
     int workCount = p.workBuffer[0].x;
@@ -396,162 +397,168 @@ __global__ void AntialiasGradKernel(const AntialiasKernelParams p)
     {
         // Persistent threads work fetcher.
         __syncthreads();
-        if (threadIdx.x == 0)
+        if (threadIdx.x == 0) {
             s_base = atomicAdd(&p.workBuffer[0].y, AA_GRAD_KERNEL_THREADS_PER_BLOCK);
+        }
         __syncthreads();
+        if (s_base >= workCount) break;
         int thread_idx = s_base + threadIdx.x;
-        if (thread_idx >= workCount)
-            return;
+        // if (thread_idx >= workCount)
+        //     return;
+        if (thread_idx < workCount) {
 
-        // Read work item filled out by forward kernel.
-        int4 item = p.workBuffer[thread_idx + 1];
-        unsigned int amask = __ballot_sync(0xffffffffu, item.w);
-        if (item.w == 0)
-            continue; // No effect.
+            // Read work item filled out by forward kernel.
+            int4 item = p.workBuffer[thread_idx + 1];
+            // unsigned int amask = __ballot_sync(0xffffffffu, item.w);
+            unsigned int amask = ballot_sync(s_ballot, ~0u, item.w, AA_GRAD_KERNEL_THREADS_PER_BLOCK);
+            if (item.w == 0)
+                continue; // No effect.
 
-        // Unpack work item and replicate setup from forward analysis kernel.
-        int px = item.x;
-        int py = item.y;
-        int pz = (int)(((unsigned int)item.z) >> 16);
-        int d = (item.z >> AAWorkItem::FLAG_DOWN_BIT) & 1;
-        float alpha = __int_as_float(item.w);
-        int tri1 = (item.z >> AAWorkItem::FLAG_TRI1_BIT) & 1;
-        int di = item.z & AAWorkItem::EDGE_MASK;
-        float ds = __int_as_float(__float_as_int(1.0) | (tri1 << 31));
-        int pixel0 = px + p.width * (py + p.height * pz);
-        int pixel1 = pixel0 + (d ? p.width : 1);
-        int tri = float_to_triidx(p.rasterOut[((tri1 ? pixel1 : pixel0) << 2) + 3]) - 1;
-        if (tri1)
-        {
-            px += 1 - d;
-            py += d;
-        }
-
-        // Bail out if triangle index is corrupt.
-        bool triFail = (tri < 0 || tri >= p.numTriangles);
-        amask = __ballot_sync(amask, !triFail);
-        if (triFail)
-            continue;
-
-        // Outgoing color gradients.
-        float* pGrad0 = p.gradColor + pixel0 * p.channels;
-        float* pGrad1 = p.gradColor + pixel1 * p.channels;
-
-        // Incoming color gradients.
-        const float* pDy = p.dy + (alpha > 0.f ? pixel0 : pixel1) * p.channels;
-
-        // Position gradient weight based on colors and incoming gradients.
-        float dd = 0.f;
-        const float* pColor0 = p.color + pixel0 * p.channels;
-        const float* pColor1 = p.color + pixel1 * p.channels;
-
-        // Loop over channels and accumulate.
-        for (int i=0; i < p.channels; i++)
-        {
-            float dy = pDy[i];
-            if (dy != 0.f)
+            // Unpack work item and replicate setup from forward analysis kernel.
+            int px = item.x;
+            int py = item.y;
+            int pz = (int)(((unsigned int)item.z) >> 16);
+            int d = (item.z >> AAWorkItem::FLAG_DOWN_BIT) & 1;
+            float alpha = __int_as_float(item.w);
+            int tri1 = (item.z >> AAWorkItem::FLAG_TRI1_BIT) & 1;
+            int di = item.z & AAWorkItem::EDGE_MASK;
+            float ds = __int_as_float(__float_as_int(1.0) | (tri1 << 31));
+            int pixel0 = px + p.width * (py + p.height * pz);
+            int pixel1 = pixel0 + (d ? p.width : 1);
+            int tri = float_to_triidx(p.rasterOut[((tri1 ? pixel1 : pixel0) << 2) + 3]) - 1;
+            if (tri1)
             {
-                // Update position gradient weight.
-                dd += dy * (pColor1[i] - pColor0[i]);
-
-                // Update color gradients. No coalescing because all have different targets.
-                float v = alpha * dy;
-                atomicAdd(&pGrad0[i], -v);
-                atomicAdd(&pGrad1[i], v);
+                px += 1 - d;
+                py += d;
             }
+
+            // Bail out if triangle index is corrupt.
+            bool triFail = (tri < 0 || tri >= p.numTriangles);
+            amask = ballot_sync(s_ballot, amask, !triFail, AA_GRAD_KERNEL_THREADS_PER_BLOCK);
+            if (triFail)
+                continue;
+
+            // Outgoing color gradients.
+            float* pGrad0 = p.gradColor + pixel0 * p.channels;
+            float* pGrad1 = p.gradColor + pixel1 * p.channels;
+
+            // Incoming color gradients.
+            const float* pDy = p.dy + (alpha > 0.f ? pixel0 : pixel1) * p.channels;
+
+            // Position gradient weight based on colors and incoming gradients.
+            float dd = 0.f;
+            const float* pColor0 = p.color + pixel0 * p.channels;
+            const float* pColor1 = p.color + pixel1 * p.channels;
+
+            // Loop over channels and accumulate.
+            for (int i=0; i < p.channels; i++)
+            {
+                float dy = pDy[i];
+                if (dy != 0.f)
+                {
+                    // Update position gradient weight.
+                    dd += dy * (pColor1[i] - pColor0[i]);
+
+                    // Update color gradients. No coalescing because all have different targets.
+                    float v = alpha * dy;
+                    atomicAdd(&pGrad0[i], -v);
+                    atomicAdd(&pGrad1[i], v);
+                }
+            }
+
+            // If position weight is zero, skip the rest.
+            bool noGrad = (dd == 0.f);
+            amask = ballot_sync(s_ballot, amask, !noGrad, AA_GRAD_KERNEL_THREADS_PER_BLOCK);
+            if (noGrad)
+                continue;
+
+            // Fetch vertex indices of the active edge and their positions.
+            int i1 = (di < 2) ? (di + 1) : 0;
+            int i2 = (i1 < 2) ? (i1 + 1) : 0;
+            int vi1 = p.tri[3 * tri + i1];
+            int vi2 = p.tri[3 * tri + i2];
+
+            // Bail out if vertex indices are corrupt.
+            bool vtxFail = (vi1 < 0 || vi1 >= p.numVertices || vi2 < 0 || vi2 >= p.numVertices);
+            amask = ballot_sync(s_ballot, amask, !vtxFail, AA_GRAD_KERNEL_THREADS_PER_BLOCK);
+            if (vtxFail)
+                continue;
+
+            // Instance mode: Adjust vertex indices based on minibatch index.
+            if (p.instance_mode)
+            {
+                vi1 += pz * p.numVertices;
+                vi2 += pz * p.numVertices;
+            }
+
+            // Fetch vertex positions.
+            float4 p1 = ((float4*)p.pos)[vi1];
+            float4 p2 = ((float4*)p.pos)[vi2];
+
+            // Project vertices to pixel space.
+            float pxh = p.xh;
+            float pyh = p.yh;
+            float fx = (float)px + .5f - pxh;
+            float fy = (float)py + .5f - pyh;
+
+            // XY flip for horizontal edges.
+            if (d)
+            {
+                swap(p1.x, p1.y);
+                swap(p2.x, p2.y);
+                swap(pxh, pyh);
+                swap(fx, fy);
+            }
+
+            // Gradient calculation setup.
+            float w1 = 1.f / p1.w;
+            float w2 = 1.f / p2.w;
+            float x1 = p1.x * w1 * pxh - fx;
+            float y1 = p1.y * w1 * pyh - fy;
+            float x2 = p2.x * w2 * pxh - fx;
+            float y2 = p2.y * w2 * pyh - fy;
+            float dx = x2 - x1;
+            float dy = y2 - y1;
+            float db = x1*dy - y1*dx;
+
+            // Compute inverse delta-y with epsilon.
+            float ep = copysignf(1e-3f, dy); // ~1/1000 pixel.
+            float iy = 1.f / (dy + ep);
+
+            // Compute position gradients.
+            float dby = db * iy;
+            float iw1 = -w1 * iy * dd;
+            float iw2 =  w2 * iy * dd;
+            float gp1x = iw1 * pxh * y2;
+            float gp2x = iw2 * pxh * y1;
+            float gp1y = iw1 * pyh * (dby - x2);
+            float gp2y = iw2 * pyh * (dby - x1);
+            float gp1w = -(p1.x * gp1x + p1.y * gp1y) * w1;
+            float gp2w = -(p2.x * gp2x + p2.y * gp2y) * w2;
+
+            // XY flip the gradients.
+            if (d)
+            {
+                swap(gp1x, gp1y);
+                swap(gp2x, gp2y);
+            }
+
+            // Kill position gradients if alpha was saturated.
+            if (fabsf(alpha) >= 0.5f)
+            {
+                gp1x = gp1y = gp1w = 0.f;
+                gp2x = gp2y = gp2w = 0.f;
+            }
+
+            // Initialize coalesced atomics. Match both triangle ID and edge index.
+            // Also note that some threads may be inactive.
+            // CA_SET_GROUP_MASK(tri ^ (di << 30), amask);
+            CA_SET_GROUP_MASK(tri ^ (di << 30), amask, AA_GRAD_KERNEL_THREADS_PER_BLOCK);
+
+            // Accumulate gradients.
+            caAtomicAdd3_xyw(p.gradPos + 4 * vi1, gp1x, gp1y, gp1w);
+            caAtomicAdd3_xyw(p.gradPos + 4 * vi2, gp2x, gp2y, gp2w);
         }
-
-        // If position weight is zero, skip the rest.
-        bool noGrad = (dd == 0.f);
-        amask = __ballot_sync(amask, !noGrad);
-        if (noGrad)
-            continue;
-
-        // Fetch vertex indices of the active edge and their positions.
-        int i1 = (di < 2) ? (di + 1) : 0;
-        int i2 = (i1 < 2) ? (i1 + 1) : 0;
-        int vi1 = p.tri[3 * tri + i1];
-        int vi2 = p.tri[3 * tri + i2];
-
-        // Bail out if vertex indices are corrupt.
-        bool vtxFail = (vi1 < 0 || vi1 >= p.numVertices || vi2 < 0 || vi2 >= p.numVertices);
-        amask = __ballot_sync(amask, !vtxFail);
-        if (vtxFail)
-            continue;
-
-        // Instance mode: Adjust vertex indices based on minibatch index.
-        if (p.instance_mode)
-        {
-            vi1 += pz * p.numVertices;
-            vi2 += pz * p.numVertices;
-        }
-
-        // Fetch vertex positions.
-        float4 p1 = ((float4*)p.pos)[vi1];
-        float4 p2 = ((float4*)p.pos)[vi2];
-
-        // Project vertices to pixel space.
-        float pxh = p.xh;
-        float pyh = p.yh;
-        float fx = (float)px + .5f - pxh;
-        float fy = (float)py + .5f - pyh;
-
-        // XY flip for horizontal edges.
-        if (d)
-        {
-            swap(p1.x, p1.y);
-            swap(p2.x, p2.y);
-            swap(pxh, pyh);
-            swap(fx, fy);
-        }
-
-        // Gradient calculation setup.
-        float w1 = 1.f / p1.w;
-        float w2 = 1.f / p2.w;
-        float x1 = p1.x * w1 * pxh - fx;
-        float y1 = p1.y * w1 * pyh - fy;
-        float x2 = p2.x * w2 * pxh - fx;
-        float y2 = p2.y * w2 * pyh - fy;
-        float dx = x2 - x1;
-        float dy = y2 - y1;
-        float db = x1*dy - y1*dx;
-
-        // Compute inverse delta-y with epsilon.
-        float ep = copysignf(1e-3f, dy); // ~1/1000 pixel.
-        float iy = 1.f / (dy + ep);
-
-        // Compute position gradients.
-        float dby = db * iy;
-        float iw1 = -w1 * iy * dd;
-        float iw2 =  w2 * iy * dd;
-        float gp1x = iw1 * pxh * y2;
-        float gp2x = iw2 * pxh * y1;
-        float gp1y = iw1 * pyh * (dby - x2);
-        float gp2y = iw2 * pyh * (dby - x1);
-        float gp1w = -(p1.x * gp1x + p1.y * gp1y) * w1;
-        float gp2w = -(p2.x * gp2x + p2.y * gp2y) * w2;
-
-        // XY flip the gradients.
-        if (d)
-        {
-            swap(gp1x, gp1y);
-            swap(gp2x, gp2y);
-        }
-
-        // Kill position gradients if alpha was saturated.
-        if (fabsf(alpha) >= 0.5f)
-        {
-            gp1x = gp1y = gp1w = 0.f;
-            gp2x = gp2y = gp2w = 0.f;
-        }
-
-        // Initialize coalesced atomics. Match both triangle ID and edge index.
-        // Also note that some threads may be inactive.
-        CA_SET_GROUP_MASK(tri ^ (di << 30), amask);
-
-        // Accumulate gradients.
-        caAtomicAdd3_xyw(p.gradPos + 4 * vi1, gp1x, gp1y, gp1w);
-        caAtomicAdd3_xyw(p.gradPos + 4 * vi2, gp2x, gp2y, gp2w);
     }
 }
 

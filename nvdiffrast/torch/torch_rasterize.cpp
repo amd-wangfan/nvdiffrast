@@ -13,9 +13,18 @@
 #include "../common/cudaraster/CudaRaster.hpp"
 #include "../common/cudaraster/impl/Constants.hpp"
 #include <tuple>
+#ifdef USE_ROCM
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#endif
 
 //------------------------------------------------------------------------
 // Kernel prototypes.
+
+#ifdef USE_ROCM
+#define LAUNCH_KERNEL hipLaunchKernel
+#else
+#define LAUNCH_KERNEL cudaLaunchKernel
+#endif
 
 void RasterizeCudaFwdShaderKernel(const RasterizeCudaFwdShaderParams p);
 void RasterizeGradKernel(const RasterizeGradParams p);
@@ -159,8 +168,7 @@ std::tuple<torch::Tensor, torch::Tensor> rasterize_fwd_cuda(RasterizeCRStateWrap
 
     // Launch CUDA kernel.
     void* args[] = {&p};
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel((void*)RasterizeCudaFwdShaderKernel, gridSize, blockSize, args, 0, stream));
-
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL((void*)RasterizeCudaFwdShaderKernel, gridSize, blockSize, args, 0, stream));
     // Return.
     return std::tuple<torch::Tensor, torch::Tensor>(out, out_db);
 }
@@ -249,7 +257,7 @@ torch::Tensor rasterize_grad_db(torch::Tensor pos, torch::Tensor tri, torch::Ten
     // Launch CUDA kernel.
     void* args[] = {&p};
     void* func = enable_db ? (void*)RasterizeGradKernelDb : (void*)RasterizeGradKernel;
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel(func, gridSize, blockSize, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL(func, gridSize, blockSize, args, 0, stream));
 
     // Return the gradients.
     return grad;

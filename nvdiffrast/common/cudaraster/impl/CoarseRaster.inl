@@ -43,6 +43,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
     __shared__ volatile S32 s_tileStreamCurrOfs [CR_BIN_SQR];                       // 1KB
     __shared__ volatile U32 s_firstAllocSeg;
     __shared__ volatile U32 s_firstActiveIdx;
+    __shared__ volatile U32 s_ballot            [32 * CR_COARSE_WARPS];
 
     // Pointers and constants.
 
@@ -72,8 +73,22 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
     {
         s_tileEmitPrefixSum[0] = 0;
         s_tileAllocPrefixSum[0] = 0;
+
+        s_workCounter = 0; // FIXME: workCounter is not consistant after __sync
+        s_triQueueWritePos = 0;
+        s_binStreamSelectedOfs = 0;
+        s_binStreamSelectedSize = 0;
+        s_firstAllocSeg = 0;
     }
     s_scanTemp[threadIdx.y][threadIdx.x] = 0;
+
+    // init sort bins
+    if (thrInBlock < 32) {
+        for (int i = 0; i < CR_MAXBINS_SQR / 32; i += 32) {
+            s_binOrder[threadIdx.x] = 0;
+        }
+    }
+    __syncthreads();
 
     // Sort bins in descending order of triangle count.
 
@@ -151,9 +166,11 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
                 // First warp: Choose the segment with the lowest initial triangle index.
 
                 bool hasStream = (thrInBlock < CR_BIN_STREAMS_SIZE);
-                U32 hasStreamMask = __ballot_sync(~0u, hasStream);
+                // U32 hasStreamMask = __ballot_sync(~0u, hasStream);
+                U32 hasStreamMask = ballot_sync(s_ballot, ~0u, hasStream);
                 if (hasStream)
                 {
+                    auto active_threads = cooperative_groups::coalesced_threads();
                     // Find the stream with the lowest triangle index.
 
                     U32 firstTri = s_binStreamFirstTri[thrInBlock];
@@ -161,26 +178,27 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
                     volatile U32* v = &s_scanTemp[0][thrInBlock + 16];
 
                     #if (CR_BIN_STREAMS_SIZE > 1)
-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-1]); __syncwarp(hasStreamMask);
+                        v[0] = t; active_threads.sync(); t = ::min(t, v[-1]); active_threads.sync();
                     #endif
                     #if (CR_BIN_STREAMS_SIZE > 2)
-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-2]); __syncwarp(hasStreamMask);
+                        v[0] = t; active_threads.sync(); t = ::min(t, v[-2]); active_threads.sync();
                     #endif
                     #if (CR_BIN_STREAMS_SIZE > 4)
-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-4]); __syncwarp(hasStreamMask);
+                        v[0] = t; active_threads.sync(); t = ::min(t, v[-4]); active_threads.sync();
                     #endif
                     #if (CR_BIN_STREAMS_SIZE > 8)
-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-8]); __syncwarp(hasStreamMask);
+                        v[0] = t; active_threads.sync(); t = ::min(t, v[-8]); active_threads.sync();
                     #endif
                     #if (CR_BIN_STREAMS_SIZE > 16)
-                        v[0] = t; __syncwarp(hasStreamMask); t = ::min(t, v[-16]); __syncwarp(hasStreamMask);
+                        v[0] = t; active_threads.sync(); t = ::min(t, v[-16]); active_threads.sync();
                     #endif
-                    v[0] = t; __syncwarp(hasStreamMask);
+                    v[0] = t; active_threads.sync();
 
                     // Consume and broadcast.
 
                     bool first = (s_scanTemp[0][CR_BIN_STREAMS_SIZE - 1 + 16] == firstTri);
-                    U32 firstMask = __ballot_sync(hasStreamMask, first);
+                    // U32 firstMask = __ballot_sync(hasStreamMask, first);
+                    U32 firstMask = ballot_sync(s_ballot, hasStreamMask, first);
                     if (first && (firstMask >> threadIdx.x) == 1u)
                     {
                         int segIdx = s_binStreamCurrSeg[thrInBlock];
@@ -246,7 +264,8 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
 
             // 32 triangles per warp: Record emits (= tile intersections).
 
-            if (__any_sync(~0u, triIdx != -1))
+            // if (__any_sync(~0u, triIdx != -1))
+            if (any_sync(s_ballot, ~0u, triIdx != -1))
             {
                 S32 v0x = sub_s16lo_s16lo(triData.x, originX);
                 S32 v0y = sub_s16hi_s16lo(triData.x, originY);
@@ -273,7 +292,8 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
 
                 // Case A: All AABBs are small => record the full AABB using atomics.
 
-                if (__all_sync(~0u, sizex <= 2 && sizey <= 2))
+                // if (__all_sync(~0u, sizex <= 2 && sizey <= 2))
+                if (all_sync(s_ballot, ~0u, sizex <= 2 && sizey <= 2))
                 {
                     if (triIdx != -1)
                     {
@@ -285,6 +305,7 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
                 }
                 else
                 {
+                    auto active_threads = cooperative_groups::coalesced_threads();
                     // Compute warp-AABB (scan-32).
 
                     U32 aabbMask = add_sub(2 << hix, 0x20000 << hiy, 1 << lox) - (0x10000 << loy);
@@ -292,12 +313,12 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
                         aabbMask = 0;
 
                     volatile U32* v = &s_scanTemp[threadIdx.y][threadIdx.x + 16];
-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-1]; __syncwarp();
-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-2]; __syncwarp();
-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-4]; __syncwarp();
-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-8]; __syncwarp();
-                    v[0] = aabbMask; __syncwarp(); aabbMask |= v[-16]; __syncwarp();
-                    v[0] = aabbMask; __syncwarp(); aabbMask = s_scanTemp[threadIdx.y][47];
+                    v[0] = aabbMask; active_threads.sync(); aabbMask |= v[-1]; active_threads.sync();
+                    v[0] = aabbMask; active_threads.sync(); aabbMask |= v[-2]; active_threads.sync();
+                    v[0] = aabbMask; active_threads.sync(); aabbMask |= v[-4]; active_threads.sync();
+                    v[0] = aabbMask; active_threads.sync(); aabbMask |= v[-8]; active_threads.sync();
+                    v[0] = aabbMask; active_threads.sync(); aabbMask |= v[-16]; active_threads.sync();
+                    v[0] = aabbMask; active_threads.sync(); aabbMask = s_scanTemp[threadIdx.y][47];
 
                     U32 maskX = aabbMask & 0xFFFF;
                     U32 maskY = aabbMask >> 16;
@@ -326,26 +347,31 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
                     d12x += sizex * d12y;
 
                     // Case B: Warp-AABB is not much larger than largest AABB => Check tiles in warp-AABB, record using ballots.
-                    if (__any_sync(~0u, warea * 4 <= area * 8))
+                    // if (__any_sync(~0u, warea * 4 <= area * 8))
+                    if (any_sync(s_ballot, ~0u, warea * 4 <= area * 8))
                     {
                         // Not sure if this is any faster than Case C after all the post-Volta ballot mask tracking.
                         bool act = (triIdx != -1);
-                        U32 actMask = __ballot_sync(~0u, act);
+                        // U32 actMask = __ballot_sync(~0u, act);
+                        U32 actMask = ballot_sync(s_ballot, ~0u, act);
                         if (act)
                         {
                             for (int y = wloy; y <= whiy; y++)
                             {
                                 bool yIn = (y >= loy && y <= hiy);
-                                U32 yMask = __ballot_sync(actMask, yIn);
+                                // U32 yMask = __ballot_sync(actMask, yIn);
+                                U32 yMask = ballot_sync(s_ballot, actMask, yIn);
                                 if (yIn)
                                 {
                                     for (int x = wlox; x <= whix; x++)
                                     {
                                         bool xyIn = (x >= lox && x <= hix);
-                                        U32 xyMask = __ballot_sync(yMask, xyIn);
+                                        // U32 xyMask = __ballot_sync(yMask, xyIn);
+                                        U32 xyMask = ballot_sync(s_ballot, yMask, xyIn);
                                         if (xyIn)
                                         {
-                                            U32 res = __ballot_sync(xyMask, b01 >= 0 && b02 >= 0 && b12 >= 0);
+                                            // U32 res = __ballot_sync(xyMask, b01 >= 0 && b02 >= 0 && b12 >= 0);
+                                            U32 res = ballot_sync(s_ballot, xyMask,  b01 >= 0 && b02 >= 0 && b12 >= 0);
                                             if (threadIdx.x == 31 - __clz(xyMask))
                                                 *(U32*)currPtr = res;
                                             currPtr += 4, b01 -= d01y, b02 += d02y, b12 -= d12y;
@@ -391,7 +417,8 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
             {
                 int tileInBin = tileInBin_base + thrInBlock;
                 bool act = (tileInBin < CR_BIN_SQR);
-                U32 actMask = __ballot_sync(~0u, act);
+                // U32 actMask = __ballot_sync(~0u, act);
+                U32 actMask = ballot_sync(s_ballot, ~0u, act);
                 if (act)
                 {
                     // Compute prefix sum of emits over warps.
@@ -415,23 +442,26 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
 
                     // All counters within the warp are small => compute prefix sum using ballot.
 
-                    if (!__any_sync(actMask, tileEmits >= 2))
+                    // if (!__any_sync(actMask, tileEmits >= 2))
+                    if (!any_sync(s_ballot, actMask, tileEmits >= 2))
                     {
                         U32 m = getLaneMaskLe();
-                        *v = (__popc(__ballot_sync(actMask, tileEmits & 1) & m) << emitShift) | __popc(__ballot_sync(actMask, tileAllocs & 1) & m);
+                        // *v = (__popc(__ballot_sync(actMask, tileEmits & 1) & m) << emitShift) | __popc(__ballot_sync(actMask, tileAllocs & 1) & m);
+                        *v = (__popc(ballot_sync(s_ballot, actMask, tileEmits & 1) & m) << emitShift) | __popc(ballot_sync(s_ballot, actMask, tileAllocs & 1) & m);
                     }
 
                     // Otherwise => scan-32 within the warp.
 
                     else
                     {
+                        auto active_threads = cooperative_groups::coalesced_threads();
                         U32 sum = (tileEmits << emitShift) | tileAllocs;
-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 1)  sum += v[-1]; __syncwarp(actMask);
-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 2)  sum += v[-2]; __syncwarp(actMask);
-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 4)  sum += v[-4]; __syncwarp(actMask);
-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 8)  sum += v[-8]; __syncwarp(actMask);
-                        *v = sum; __syncwarp(actMask); if (threadIdx.x >= 16) sum += v[-16]; __syncwarp(actMask);
-                        *v = sum; __syncwarp(actMask);
+                        *v = sum; active_threads.sync(); if (threadIdx.x >= 1)  sum += v[-1]; active_threads.sync();
+                        *v = sum; active_threads.sync(); if (threadIdx.x >= 2)  sum += v[-2]; active_threads.sync();
+                        *v = sum; active_threads.sync(); if (threadIdx.x >= 4)  sum += v[-4]; active_threads.sync();
+                        *v = sum; active_threads.sync(); if (threadIdx.x >= 8)  sum += v[-8]; active_threads.sync();
+                        *v = sum; active_threads.sync(); if (threadIdx.x >= 16) sum += v[-16]; active_threads.sync();
+                        *v = sum; active_threads.sync();
                     }
                 }
             }
@@ -441,20 +471,22 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
             __syncthreads();
 
             bool scan8 = (thrInBlock < CR_BIN_SQR / 32);
-            U32 scan8Mask = __ballot_sync(~0u, scan8);
+            // U32 scan8Mask = __ballot_sync(~0u, scan8);
+            U32 scan8Mask = ballot_sync(s_ballot, ~0u, scan8);
             if (scan8)
             {
+                auto active_threads = cooperative_groups::coalesced_threads();
                 int sum = s_tileEmitPrefixSum[(thrInBlock << 5) + 32];
                 volatile U32* v = &s_scanTemp[0][thrInBlock + 16];
-                v[0] = sum; __syncwarp(scan8Mask);
+                v[0] = sum; active_threads.sync();
                 #if (CR_BIN_SQR > 1 * 32)
-                    sum += v[-1]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
+                    sum += v[-1]; active_threads.sync(); v[0] = sum; active_threads.sync();
                 #endif
                 #if (CR_BIN_SQR > 2 * 32)
-                    sum += v[-2]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
+                    sum += v[-2]; active_threads.sync(); v[0] = sum; active_threads.sync();
                 #endif
                 #if (CR_BIN_SQR > 4 * 32)
-                    sum += v[-4]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
+                    sum += v[-4]; active_threads.sync(); v[0] = sum; active_threads.sync();
                 #endif
             }
 
@@ -654,7 +686,8 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
         {
             int tileInBin = tileInBin_base + thrInBlock;
             bool act = (tileInBin < CR_BIN_SQR);
-            U32 actMask = __ballot_sync(~0u, act);
+            // U32 actMask = __ballot_sync(~0u, act);
+            U32 actMask = ballot_sync(s_ballot, ~0u, act);
             if (act)
             {
                 int tileX = tileInBin & (CR_BIN_SIZE - 1);
@@ -676,7 +709,8 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
                 if (segCount != 0)
                     tileSegCount[segIdx] = segCount;
 
-                U32 res = __ballot_sync(actMask, ofs >= 0 | force);
+                // U32 res = __ballot_sync(actMask, ofs >= 0 | force);
+                U32 res = ballot_sync(s_ballot, actMask, ofs >= 0 | force);
                 if (threadIdx.x == 0)
                     s_scanTemp[0][(tileInBin >> 5) + 16] = __popc(res);
             }
@@ -688,19 +722,21 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
         __syncthreads();
 
         bool scan8 = (thrInBlock < CR_BIN_SQR / 32);
-        U32 scan8Mask = __ballot_sync(~0u, scan8);
+        // U32 scan8Mask = __ballot_sync(~0u, scan8);
+        U32 scan8Mask = ballot_sync(s_ballot, ~0u, scan8);
         if (scan8)
         {
+            auto active_threads = cooperative_groups::coalesced_threads();
             volatile U32* v = &s_scanTemp[0][thrInBlock + 16];
             U32 sum = v[0];
             #if (CR_BIN_SQR > 1 * 32)
-                sum += v[-1]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
+                sum += v[-1]; active_threads.sync(); v[0] = sum; active_threads.sync();
             #endif
             #if (CR_BIN_SQR > 2 * 32)
-                sum += v[-2]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
+                sum += v[-2]; active_threads.sync(); v[0] = sum; active_threads.sync();
             #endif
             #if (CR_BIN_SQR > 4 * 32)
-                sum += v[-4]; __syncwarp(scan8Mask); v[0] = sum; __syncwarp(scan8Mask);
+                sum += v[-4]; active_threads.sync(); v[0] = sum; active_threads.sync();
             #endif
 
             if (thrInBlock == CR_BIN_SQR / 32 - 1)
@@ -715,7 +751,8 @@ __device__ __inline__ void coarseRasterImpl(const CRParams p)
         {
             int tileInBin = tileInBin_base + thrInBlock;
             bool act = (tileInBin < CR_BIN_SQR) && (s_tileStreamCurrOfs[tileInBin] >= 0);
-            U32 actMask = __ballot_sync(~0u, act);
+            // U32 actMask = __ballot_sync(~0u, act);
+            U32 actMask = ballot_sync(s_ballot, ~0u, act);
             if (act)
             {
                 int activeIdx = s_firstActiveIdx;

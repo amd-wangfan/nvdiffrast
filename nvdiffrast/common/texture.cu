@@ -94,6 +94,14 @@ static __device__ __forceinline__ int4 wrapCubeMap(int face, int ix0, int ix1, i
 //------------------------------------------------------------------------
 // Cube map indexing and gradient functions.
 
+#ifdef USE_ROCM
+// gfx arch not support __frcp_rz
+static __device__ __forceinline__ float __frcp_rz(float val) {
+    float y = __fdividef(1.0f, val); // 1.0f / val
+    return __builtin_truncf(y);     // round to zero
+}
+#endif
+
 // Map a 3D lookup vector into an (s,t) face coordinates (returned in first .
 // two parameters) and face index.
 static __device__ __forceinline__ int indexCubeMap(float& x, float& y, float z)
@@ -613,7 +621,7 @@ static __device__ __forceinline__ void fetchQuad(T& a00, T& a10, T& a01, T& a11,
     }
 }
 
-static __device__ __forceinline__ void accumQuad(float4 c, float* pOut, int level, int4 tc, bool corner, CA_TEMP_PARAM)
+static __device__ __forceinline__ void accumQuad(float4 c, float* pOut, int level, int4 tc, bool corner, CA_TEMP_PARAM, CA_SYNC_TEMP_PARAM)
 {
     // For invalid cube map uv, tc will be all negative, and no accumulation will take place.
     if (corner)
@@ -624,17 +632,17 @@ static __device__ __forceinline__ void accumQuad(float4 c, float* pOut, int leve
         if (tc.z < 0) cb = c.z;
         if (tc.w < 0) cb = c.w;
         cb *= 0.33333333f;
-        if (tc.x >= 0) caAtomicAddTexture(pOut, level, tc.x, c.x + cb);
-        if (tc.y >= 0) caAtomicAddTexture(pOut, level, tc.y, c.y + cb);
-        if (tc.z >= 0) caAtomicAddTexture(pOut, level, tc.z, c.z + cb);
-        if (tc.w >= 0) caAtomicAddTexture(pOut, level, tc.w, c.w + cb);
+        if (tc.x >= 0) caAtomicAddTexture(pOut, level, tc.x, c.x + cb, TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
+        if (tc.y >= 0) caAtomicAddTexture(pOut, level, tc.y, c.y + cb, TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
+        if (tc.z >= 0) caAtomicAddTexture(pOut, level, tc.z, c.z + cb, TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
+        if (tc.w >= 0) caAtomicAddTexture(pOut, level, tc.w, c.w + cb, TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
     }
     else
     {
-        if (tc.x >= 0) caAtomicAddTexture(pOut, level, tc.x, c.x);
-        if (tc.y >= 0) caAtomicAddTexture(pOut, level, tc.y, c.y);
-        if (tc.z >= 0) caAtomicAddTexture(pOut, level, tc.z, c.z);
-        if (tc.w >= 0) caAtomicAddTexture(pOut, level, tc.w, c.w);
+        if (tc.x >= 0) caAtomicAddTexture(pOut, level, tc.x, c.x, TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
+        if (tc.y >= 0) caAtomicAddTexture(pOut, level, tc.y, c.y, TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
+        if (tc.z >= 0) caAtomicAddTexture(pOut, level, tc.z, c.z, TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
+        if (tc.w >= 0) caAtomicAddTexture(pOut, level, tc.w, c.w, TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
     }
 }
 
@@ -907,6 +915,7 @@ static __forceinline__ __device__ void TextureGradKernelTemplate(const TextureKe
 {
     // Temporary space for coalesced atomics.
     CA_DECLARE_TEMP(TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH * TEX_GRAD_MAX_KERNEL_BLOCK_HEIGHT);
+    CA_DECLARE_SYNC_TEMP(TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH * TEX_GRAD_MAX_KERNEL_BLOCK_HEIGHT);
 
     // Calculate pixel position.
     int px = blockIdx.x * blockDim.x + threadIdx.x;
@@ -989,7 +998,7 @@ static __forceinline__ __device__ void TextureGradKernelTemplate(const TextureKe
 
         // Accumulate texture gradients.
         for (int i=0; i < p.channels; i++)
-            caAtomicAddTexture(pOut, 0, tc + i, pDy[i]);
+            caAtomicAddTexture(pOut, 0, tc + i, pDy[i], TEX_GRAD_MAX_KERNEL_BLOCK_WIDTH);
 
         return; // Exit.
     }
@@ -1032,7 +1041,7 @@ static __forceinline__ __device__ void TextureGradKernelTemplate(const TextureKe
         for (int i=0; i < p.channels; i++, tc0 += 1)
         {
             float dy = pDy[i];
-            accumQuad(tw0 * dy, pOut0, level0, tc0, corner0, CA_TEMP);
+            accumQuad(tw0 * dy, pOut0, level0, tc0, corner0, CA_TEMP, CA_SYNC_TEMP);
 
             float a00, a10, a01, a11;
             fetchQuad<float>(a00, a10, a01, a11, pIn0, tc0, corner0);
@@ -1078,7 +1087,7 @@ static __forceinline__ __device__ void TextureGradKernelTemplate(const TextureKe
     {
         float dy = pDy[i];
         float dy0 = (1.f - flevel) * dy;
-        accumQuad(tw0 * dy0, pOut0, level0, tc0, corner0, CA_TEMP);
+        accumQuad(tw0 * dy0, pOut0, level0, tc0, corner0, CA_TEMP, CA_SYNC_TEMP);
 
         // UV gradients for first level.
         float a00, a10, a01, a11;
@@ -1092,7 +1101,7 @@ static __forceinline__ __device__ void TextureGradKernelTemplate(const TextureKe
         {
             // Texture gradients for second level.
             float dy1 = flevel * dy;
-            accumQuad(tw1 * dy1, pOut1, level1, tc1, corner1, CA_TEMP);
+            accumQuad(tw1 * dy1, pOut1, level1, tc1, corner1, CA_TEMP, CA_SYNC_TEMP);
 
             // UV gradients for second level.
             float b00, b10, b01, b11;

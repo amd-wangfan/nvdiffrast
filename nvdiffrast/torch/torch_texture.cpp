@@ -11,9 +11,18 @@
 #include "../common/common.h"
 #include "../common/texture.h"
 #include <cuda_runtime.h>
+#ifdef USE_ROCM
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#endif
 
 //------------------------------------------------------------------------
 // Kernel prototypes.
+
+#ifdef USE_ROCM
+#define LAUNCH_KERNEL hipLaunchKernel
+#else
+#define LAUNCH_KERNEL cudaLaunchKernel
+#endif
 
 void MipBuildKernel1                            (const TextureKernelParams p);
 void MipBuildKernel2                            (const TextureKernelParams p);
@@ -156,7 +165,7 @@ TextureMipWrapper texture_construct_mip(torch::Tensor tex, int max_mip_level, bo
         p.mipLevelOut = i;
 
         void* build_func_tbl[3] = { (void*)MipBuildKernel1, (void*)MipBuildKernel2, (void*)MipBuildKernel4 };
-        NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel(build_func_tbl[channel_div_idx], gridSize, blockSize, args, 0, stream));
+        NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL(build_func_tbl[channel_div_idx], gridSize, blockSize, args, 0, stream));
     }
 
     // Return the mip tensor in a wrapper.
@@ -401,7 +410,7 @@ torch::Tensor texture_fwd_mip(torch::Tensor tex, torch::Tensor uv, torch::Tensor
     func_idx = func_idx * 3 + channel_div_idx; // Choose vector size.
 
     // Launch kernel.
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel(func_tbl[func_idx], gridSize, blockSize, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL(func_tbl[func_idx], gridSize, blockSize, args, 0, stream));
 
     // Return output tensor.
     return out;
@@ -673,7 +682,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::vect
         func_idx += TEX_MODE_COUNT * 2; // Bias-only variant.
 
     // Launch main gradient kernel.
-    NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel(func_tbl[func_idx], gridSize, blockSize, args, 0, stream));
+    NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL(func_tbl[func_idx], gridSize, blockSize, args, 0, stream));
 
     // Launch kernel to pull gradients from mip levels. Don't do this if mip stack was supplied - individual level gradients are already there.
     if (p.enableMip && !has_mip_stack)
@@ -683,7 +692,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::vect
         int sharedBytes = blockSize.x * blockSize.y * p.channels * sizeof(float);
 
         void* mip_grad_func_tbl[3] = { (void*)MipGradKernel1, (void*)MipGradKernel2, (void*)MipGradKernel4 };
-        NVDR_CHECK_CUDA_ERROR(cudaLaunchKernel(mip_grad_func_tbl[channel_div_idx], gridSize, blockSize, args, sharedBytes, stream));
+        NVDR_CHECK_CUDA_ERROR(LAUNCH_KERNEL(mip_grad_func_tbl[channel_div_idx], gridSize, blockSize, args, sharedBytes, stream));
     }
 
     // Return output tensors.

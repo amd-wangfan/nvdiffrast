@@ -16,18 +16,20 @@ __device__ __inline__ void initTileZMax(U32& tileZMax, bool& tileZUpd, volatile 
     tileZUpd = (::min(tileDepth[threadIdx.x], tileDepth[threadIdx.x + 32]) < tileZMax);
 }
 
-__device__ __inline__ void updateTileZMax(U32& tileZMax, bool& tileZUpd, volatile U32* tileDepth, volatile U32* temp)
+__device__ __inline__ void updateTileZMax(U32& tileZMax, bool& tileZUpd, volatile U32* tileDepth, volatile U32* temp, volatile U32* s_ballot)
 {
+    auto active_threads = cooperative_groups::coalesced_threads();
     // Entry is warp-coherent.
-    if (__any_sync(~0u, tileZUpd))
+    // if (__any_sync(~0u, tileZUpd))
+    if (any_sync(s_ballot, ~0u, tileZUpd))
     {
-        U32 z = ::max(tileDepth[threadIdx.x], tileDepth[threadIdx.x + 32]); __syncwarp();
-        temp[threadIdx.x + 16] = z; __syncwarp();
-        z = ::max(z, temp[threadIdx.x + 16 -  1]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
-        z = ::max(z, temp[threadIdx.x + 16 -  2]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
-        z = ::max(z, temp[threadIdx.x + 16 -  4]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
-        z = ::max(z, temp[threadIdx.x + 16 -  8]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
-        z = ::max(z, temp[threadIdx.x + 16 - 16]); __syncwarp(); temp[threadIdx.x + 16] = z; __syncwarp();
+        U32 z = ::max(tileDepth[threadIdx.x], tileDepth[threadIdx.x + 32]); active_threads.sync();
+        temp[threadIdx.x + 16] = z; active_threads.sync();
+        z = ::max(z, temp[threadIdx.x + 16 -  1]); active_threads.sync(); temp[threadIdx.x + 16] = z; active_threads.sync();
+        z = ::max(z, temp[threadIdx.x + 16 -  2]); active_threads.sync(); temp[threadIdx.x + 16] = z; active_threads.sync();
+        z = ::max(z, temp[threadIdx.x + 16 -  4]); active_threads.sync(); temp[threadIdx.x + 16] = z; active_threads.sync();
+        z = ::max(z, temp[threadIdx.x + 16 -  8]); active_threads.sync(); temp[threadIdx.x + 16] = z; active_threads.sync();
+        z = ::max(z, temp[threadIdx.x + 16 - 16]); active_threads.sync(); temp[threadIdx.x + 16] = z; active_threads.sync();
         tileZMax = temp[47];
         tileZUpd = false;
     }
@@ -104,13 +106,15 @@ __device__ __inline__ U64 trianglePixelCoverage(const CRParams& p, const uint4& 
 
 __device__ __inline__ U32 scan32_value(U32 value, volatile U32* temp)
 {
-    __syncwarp();
-    temp[threadIdx.x + 16] = value; __syncwarp();
-    value += temp[threadIdx.x + 16 -  1]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
-    value += temp[threadIdx.x + 16 -  2]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
-    value += temp[threadIdx.x + 16 -  4]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
-    value += temp[threadIdx.x + 16 -  8]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
-    value += temp[threadIdx.x + 16 - 16]; __syncwarp(); temp[threadIdx.x + 16] = value; __syncwarp();
+    auto active_threads = cooperative_groups::coalesced_threads();
+    // __syncwarp();
+    active_threads.sync();
+    temp[threadIdx.x + 16] = value; active_threads.sync();
+    value += temp[threadIdx.x + 16 -  1]; active_threads.sync(); temp[threadIdx.x + 16] = value; active_threads.sync();
+    value += temp[threadIdx.x + 16 -  2]; active_threads.sync(); temp[threadIdx.x + 16] = value; active_threads.sync();
+    value += temp[threadIdx.x + 16 -  4]; active_threads.sync(); temp[threadIdx.x + 16] = value; active_threads.sync();
+    value += temp[threadIdx.x + 16 -  8]; active_threads.sync(); temp[threadIdx.x + 16] = value; active_threads.sync();
+    value += temp[threadIdx.x + 16 - 16]; active_threads.sync(); temp[threadIdx.x + 16] = value; active_threads.sync();
     return value;
 }
 
@@ -151,23 +155,30 @@ __device__ __inline__ S32 findBit(U64 mask, int idx)
 
 __device__ __inline__ void executeROP(U32 color, U32 depth, volatile U32* pColor, volatile U32* pDepth, U32 ropMask)
 {
+    auto active_threads = cooperative_groups::coalesced_threads();
     atomicMin((U32*)pDepth, depth);
-    __syncwarp(ropMask);
+    // __syncwarp(ropMask);
+    active_threads.sync();
     bool act = (depth == *pDepth);
-    __syncwarp(ropMask);
-    U32 actMask = __ballot_sync(ropMask, act);
+    // __syncwarp(ropMask);
+    active_threads.sync();
+    // U32 actMask = __ballot_sync(ropMask, act);
     if (act)
     {
+        auto act_active_threads = cooperative_groups::coalesced_threads();
         *pDepth = 0;
-        __syncwarp(actMask);
+        // __syncwarp(actMask);
+        act_active_threads.sync();
         atomicMax((U32*)pDepth, threadIdx.x);
-        __syncwarp(actMask);
+        // __syncwarp(actMask);
+        act_active_threads.sync();
         if (*pDepth == threadIdx.x)
         {
             *pDepth = depth;
             *pColor = color;
         }
-        __syncwarp(actMask);
+        // __syncwarp(actMask);
+        act_active_threads.sync();
     }
 }
 
@@ -185,6 +196,7 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
     __shared__ volatile U32 s_triangleFrag[CR_FINE_MAX_WARPS][64];          // 5KB  fragment index
     __shared__ volatile U32 s_temp        [CR_FINE_MAX_WARPS][80];          // 6.25KB
                                                                             // = 47.25KB total
+    __shared__ volatile U32 s_ballot      [32 * CR_FINE_MAX_WARPS];      // H20 shared memory total size = 48KB
 
     CRAtomics&            atomics   = p.atomics[blockIdx.z];
     const CRTriangleData* triData   = (const CRTriangleData*)p.triData + blockIdx.z * p.maxSubtris;
@@ -213,7 +225,8 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
         // pick a tile
         if (threadIdx.x == 0)
             temp[16] = atomicAdd(&atomics.fineCounter, 1);
-        __syncwarp();
+        // __syncwarp();
+        __syncthreads();
         int activeIdx = temp[16];
         if (activeIdx >= atomics.numActiveTiles)
             break;
@@ -264,11 +277,12 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
         // process fragments
         for(;;)
         {
+            auto active_threads = cooperative_groups::coalesced_threads();
             // need to queue more fragments?
             if (fragWrite - fragRead < 32 && segment >= 0)
             {
                 // update tile z - coherent over warp
-                updateTileZMax(tileZMax, tileZUpd, tileDepth, temp);
+                updateTileZMax(tileZMax, tileZUpd, tileDepth, temp, s_ballot);
 
                 // read triangles
                 do
@@ -292,7 +306,7 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
                     fragWrite += scan32_total(temp);
 
                     // queue non-empty triangles
-                    U32 goodMask = __ballot_sync(~0u, pop != 0);
+                    U32 goodMask = ballot_sync(s_ballot, ~0u, pop != 0);
                     if (pop != 0)
                     {
                         int idx = (triWrite + __popc(goodMask & getLaneMaskLt())) & 63;
@@ -304,7 +318,8 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
                 }
                 while (fragWrite - fragRead < 32 && segment >= 0);
             }
-            __syncwarp();
+            // __syncwarp();
+            active_threads.sync();
 
             // end of segment?
             if (fragRead == fragWrite)
@@ -312,7 +327,8 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
 
             // clear triangle boundaries
             temp[threadIdx.x + 16] = 0;
-            __syncwarp();
+            // __syncwarp();
+            active_threads.sync();
 
             // tag triangle boundaries
             if (triRead + threadIdx.x < triWrite)
@@ -321,14 +337,15 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
                 if (idx <= 32)
                     temp[idx + 16 - 1] = 1;
             }
-            __syncwarp();
+            // __syncwarp();
+            active_threads.sync();
 
             int ropLaneIdx = threadIdx.x;
-            U32 boundaryMask = __ballot_sync(~0u, temp[ropLaneIdx + 16]);
+            U32 boundaryMask = ballot_sync(s_ballot, ~0u, temp[ropLaneIdx + 16]);
 
             // distribute fragments
             bool hasFragment = (ropLaneIdx < fragWrite - fragRead);
-            U32 fragmentMask = __ballot_sync(~0u, hasFragment);
+            U32 fragmentMask = ballot_sync(s_ballot, ~0u, hasFragment);
             if (hasFragment)
             {
                 int triBufIdx = (triRead + __popc(boundaryMask & getLaneMaskLt())) & 63;
@@ -356,7 +373,7 @@ __device__ __inline__ void fineRasterImpl(const CRParams p)
                         tileZUpd = true; // we are replacing previous zmax => need to update
                 }
 
-                U32 ropMask = __ballot_sync(fragmentMask, !zkill);
+                U32 ropMask = ballot_sync(s_ballot, fragmentMask, !zkill);
                 if (!zkill)
 					executeROP(td.w, depth, &tileColor[pixelInTile], &tileDepth[pixelInTile], ropMask);
             }

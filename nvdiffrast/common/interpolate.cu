@@ -22,6 +22,9 @@ static __forceinline__ __device__ void InterpolateFwdKernelTemplate(const Interp
     if (px >= p.width || py >= p.height || pz >= p.depth)
         return;
 
+    // declare shared memory s_ballot
+    CA_DECLARE_SYNC_TEMP(IP_FWD_MAX_KERNEL_BLOCK_WIDTH * IP_FWD_MAX_KERNEL_BLOCK_HEIGHT);
+
     // Pixel index.
     int pidx = px + p.width * (py + p.height * pz);
 
@@ -36,7 +39,8 @@ static __forceinline__ __device__ void InterpolateFwdKernelTemplate(const Interp
 
     // If no geometry in entire warp, zero the output and exit.
     // Otherwise force barys to zero and output with live threads.
-    if (__all_sync(0xffffffffu, !triValid))
+    // if (__all_sync(0xffffffffu, !triValid))
+    if (all_sync(s_ballot, ~0u, !triValid, IP_FWD_MAX_KERNEL_BLOCK_WIDTH))
     {
         for (int i=0; i < p.numAttr; i++)
             out[i] = 0.f;
@@ -133,6 +137,7 @@ static __forceinline__ __device__ void InterpolateGradKernelTemplate(const Inter
 {
     // Temporary space for coalesced atomics.
     CA_DECLARE_TEMP(IP_GRAD_MAX_KERNEL_BLOCK_WIDTH * IP_GRAD_MAX_KERNEL_BLOCK_HEIGHT);
+    CA_DECLARE_SYNC_TEMP(IP_GRAD_MAX_KERNEL_BLOCK_WIDTH * IP_GRAD_MAX_KERNEL_BLOCK_HEIGHT);
 
     // Calculate pixel position.
     int px = blockIdx.x * blockDim.x + threadIdx.x;
@@ -175,7 +180,7 @@ static __forceinline__ __device__ void InterpolateGradKernelTemplate(const Inter
     }
 
     // Initialize coalesced atomics.
-    CA_SET_GROUP(triIdx);
+    CA_SET_GROUP(triIdx, IP_GRAD_MAX_KERNEL_BLOCK_WIDTH);
 
     // Pointers to inputs.
     const float* a0 = p.attr + vi0 * p.numAttr;
