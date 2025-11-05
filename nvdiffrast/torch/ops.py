@@ -6,7 +6,6 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import importlib
 import logging
 import numpy as np
 import os
@@ -145,20 +144,11 @@ def _get_plugin(gl=False):
         for hpp_file in cuda_raster_dir.glob("*.hpp"):
             shutil.copy(hpp_file, hip_raster_dir/hpp_file.name)
 
-    # Compile and load.
+    # Compile and store in cache.
     source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]
-    # add include path 
-    # include_dirs = sorted(set(os.path.dirname(p) for p in source_paths))
-    # include_flags = [f"-I{p}" for p in include_dirs]
-    # common_opts += include_flags
-    cuda_opts = ['-lineinfo']
-    if is_rocm:
-        cuda_opts += ['-DUSE_HIP', '-DGFX942_SUPPORTED']
+    _cached_plugin[gl] = torch.utils.cpp_extension.load(name=plugin_name, sources=source_paths, extra_cflags=common_opts+cc_opts, extra_cuda_cflags=common_opts+['-lineinfo'], extra_ldflags=ldflags, with_cuda=True, verbose=False)
 
-    torch.utils.cpp_extension.load(name=plugin_name, sources=source_paths, extra_cflags=common_opts+cc_opts, extra_cuda_cflags=common_opts+cuda_opts, extra_ldflags=ldflags, with_cuda=True, verbose=False)
-
-    # Import, cache, and return the compiled module.
-    _cached_plugin[gl] = importlib.import_module(plugin_name)
+    # Return the compiled module.
     return _cached_plugin[gl]
 
 #----------------------------------------------------------------------------
