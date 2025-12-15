@@ -231,6 +231,10 @@ static __device__ __forceinline__ bool all_sync(volatile unsigned int* s_ballot,
 
     return all_true;
 }
+#else
+// Host-side stub declarations (never called, but needed for host compilation)
+static __host__ __device__ inline unsigned int ballot_sync(volatile unsigned int* s_ballot, unsigned int mask, bool condition, int warp_size = 32) { return 0; }
+static __host__ __device__ inline bool all_sync(volatile unsigned int* s_ballot, unsigned int mask, bool condition, int warp_size = 32) { return false; }
 #endif
 
 static __device__ __forceinline__ int __hip_float_as_int(float x) {
