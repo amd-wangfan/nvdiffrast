@@ -5,7 +5,7 @@
 // and any modifications thereto.  Any use, reproduction, disclosure or
 // distribution of this software and related documentation without an express
 // license agreement from NVIDIA CORPORATION is strictly prohibited.
-#ifdef USE_HIP
+#ifdef USE_ROCM
 #include <hip/hip_cooperative_groups.h>
 #else
 #include <cooperative_groups.h>

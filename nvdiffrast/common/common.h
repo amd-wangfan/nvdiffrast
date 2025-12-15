@@ -7,7 +7,7 @@
 // license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 #pragma once
-#if (defined(USE_HIP) || defined(USE_ROCM))
+#ifdef USE_ROCM
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
 #else
@@ -24,7 +24,7 @@ dim3 getLaunchGridSize(dim3 blockSize, int width, int height, int depth);
 //------------------------------------------------------------------------
 // The rest is CUDA device code specific stuff.
 
-#if (defined(__CUDACC__) || defined(USE_HIP))
+#if (defined(__CUDACC__) || defined(USE_ROCM))
 
 //------------------------------------------------------------------------
 // Helpers for CUDA vector types.
@@ -194,7 +194,9 @@ template<class T> static __device__ __forceinline__ void swap(T& a, T& b)       
 // compatibility with previous versions. Larger values are mapped to unique float32 that are not equal to
 // the ID. The largest value that converts to float32 and back without generating inf or nan is 889192447.
 
-#ifdef USE_HIP
+// #if (defined(USE_ROCM) && defined(__HIP_DEVICE_COMPILE__))
+#ifdef USE_ROCM
+#ifdef __HIP_DEVICE_COMPILE__
 static __device__ __forceinline__ unsigned int ballot_sync(volatile unsigned int* s_ballot, unsigned int mask, bool condition, int warp_size = 32) {
     // __ballot_sync
     auto active_threads = cooperative_groups::coalesced_threads();
@@ -229,6 +231,7 @@ static __device__ __forceinline__ bool all_sync(volatile unsigned int* s_ballot,
 
     return all_true;
 }
+#endif
 
 static __device__ __forceinline__ int __hip_float_as_int(float x) {
     static_assert(sizeof(int) == sizeof(float), "");
@@ -264,7 +267,7 @@ static __device__ __forceinline__ float triidx_to_float(int x)   { if (x <= 0x01
 //------------------------------------------------------------------------
 // Coalesced atomics. These are all done via macros.
 
-#if __CUDA_ARCH__ >= 700 || defined(GFX942_SUPPORTED) // Warp match instruction __match_any_sync() is only available on compute capability 7.x and higher
+#if __CUDA_ARCH__ >= 700 || defined(USE_ROCM) // Warp match instruction __match_any_sync() is only available on compute capability 7.x and higher
 #define CA_TEMP       _ca_temp
 #define CA_SYNC_TEMP  s_ballot
 #define CA_TEMP_PARAM float* CA_TEMP
